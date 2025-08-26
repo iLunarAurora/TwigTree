@@ -7,6 +7,8 @@
 --]]
 --!optimize 2
 --!native
+--!nolint
+--!nocheck
 
 local TwigTree = {}
 TwigTree.__index = TwigTree
@@ -21,6 +23,10 @@ local function validateTwig(twig)
 	assert(typeof(twig.ClassName) == "string", "Invalid ClassName")
 	assert(not twig.Properties or typeof(twig.Properties) == "table", "Properties must be table")
 	assert(not twig.Children or typeof(twig.Children) == "table", "Children must be table")
+end
+
+local function isPlugin(plugin)
+	return typeof(plugin) == "table" and plugin.isPlugin and plugin.isPlugin == true
 end
 
 -- Base TwigTree Class
@@ -59,7 +65,7 @@ function TwigTree.create(ClassName: string, Properties: {[string|number]: any}?,
 		Children = Children or {},
 		_stateConnections = {},
 		_childHandles = {},
-		
+
 		OnMount = function() end,
 		OnUnMount = function() end
 	}, TwigTree)
@@ -67,12 +73,74 @@ function TwigTree.create(ClassName: string, Properties: {[string|number]: any}?,
 	if _G.TWIG_STRICT_MODE then
 		validateTwig(twig)
 	end
-	
+
 	if _G.TWIG_DEBUG_MODE then
 		print("[Twig] [" .. (Name or ClassName) .. "]: Creating a new TwigTree within the properties of", Properties, "and children of", Children)
 	end
 
 	return twig
+end
+
+--[[ Example:
+	local guiBlueprint = TwigTree:newUserInterface(true, false, {
+		-- cant use plugins on gui's (unless you are changing stuff inside the gui)
+	}, {
+		TwigTree.create("Frame", {
+			installments = {
+				[DragPlugin] = {
+					enabled = true
+				}
+			}
+		})
+	})
+--]]
+function TwigTree:newUserInterface(ignoreGuiInset, resetOnSpawn, plugins, chilldren)
+	ignoreGuiInset = if ignoreGuiInset == nil then true else ignoreGuiInset
+	resetOnSpawn = if resetOnSpawn == nil then false else resetOnSpawn
+	local guiConfig = {
+		IgnoreGuiInset = ignoreGuiInset,
+		ResetOnSpawn = resetOnSpawn
+	}
+
+	if plugins and typeof(plugins) == "table" then
+		plugins.installments = {}
+		for pluginData, pluginConfig in plugins do
+			plugins.installments[pluginData] = pluginConfig
+		end
+	end
+
+	return TwigTree.create("ScreenGui", guiConfig, chilldren)
+end
+
+function TwigTree.createPlugin(pluginData)
+	local onMount = pluginData and (pluginData.onMount or pluginData.OnMount)
+	local plugin = {}
+	plugin.onMount = onMount or function() end
+	plugin.isPlugin = true
+	function plugin.init(obj,...)
+		plugin.onMount(obj,...)
+	end
+	return plugin
+end
+
+--[[ Line 1
+	local GuiContext = TwigTree.createContext({ Theme = "light" })
+	Line (2-any)
+	local GuiData = GuiContext:Consumer()
+	local CurrentTheme = GuiData.Theme
+--]]
+function TwigTree.createContext(defaultValue: any)
+	local ctx = { context = defaultValue }
+
+	function ctx:editConsumer(newValue)
+		self.context = newValue
+	end
+
+	function ctx:Consumer()
+		return self.context
+	end
+
+	return ctx
 end
 
 -- TwigTree.mount is a function, that exports Twig into an Instance object, then parents it to the destined location (or set the parent to nil to just create it)
@@ -90,18 +158,23 @@ function TwigTree.mount(self: Twig, Parent: Instance): MountedHandle
 		} :: any
 	end
 
+	local handlePlugins = {}
 	local handle = {
 		instance = nil :: Instance?,
 		Cleanup = {},
 		_ref = nil
 	}
-	
+
 	local instance = Instance.new(self.ClassName)
 	handle.instance = instance
 	instance.Parent = Parent
+	task.spawn(pcall, function()
+		instance.BorderSizePixel = 0
+	end)
 
 	for propertyName, propertyValue in pairs(self.Properties) do
 		local propType = typeof(propertyValue)
+		--print(propertyName, propertyValue)
 
 		if typeof(propertyName) == "number" then
 			local eventName = TwigTree.Events:getFunctionFromInt(propertyName)
@@ -109,31 +182,47 @@ function TwigTree.mount(self: Twig, Parent: Instance): MountedHandle
 				local conn = instance[eventName]:Connect(function(...)
 					propertyValue(instance, ...)
 				end)
-				
-				table.insert(handle.Cleanup, function() conn:Disconnect() end)
+
+				table.insert(handle.Cleanup, function()
+					conn:Disconnect()
+				end)
 			end
 
 		elseif propertyName == "Ref" then
 			if type(propertyValue) == "function" then
 				propertyValue(instance)
-				table.insert(handle.Cleanup, function() propertyValue(nil) end)
+				table.insert(handle.Cleanup, function()
+					propertyValue(nil)
+				end)
 			elseif propertyValue and propertyValue._IsState then
 				propertyValue:set(instance)
-				table.insert(handle.Cleanup, function() propertyValue:set(nil) end)
+				table.insert(handle.Cleanup, function()
+					propertyValue:set(nil)
+				end)
 			end
-			
+
 		elseif propType == "table" and propertyValue._IsState then
 			instance[propertyName] = propertyValue:get()
 			local conn = propertyValue:onChanged(function(v)
 				instance[propertyName] = v
 			end)
-			
+
 			table.insert(self._stateConnections, conn)
-		else
+		elseif typeof(propertyName) == "table" and isPlugin(propertyName) then
+			local plugin = propertyName
+			table.insert(handlePlugins, {plugin = plugin, config = propertyValue})
+		elseif typeof(propertyName) == "string" and propertyName ~= "installments" then
 			instance[propertyName] = propertyValue
+		elseif typeof(propertyName) == "string" and propertyName == "installments" then
+			for pluginData, pluginConfig in pairs(propertyValue) do
+				table.insert(handlePlugins, {
+					plugin = pluginData,
+					config = pluginConfig
+				})
+			end
 		end
 	end
-	
+
 	for childKey, childTwig in pairs(self.Children) do
 		if type(childKey) == "string" then
 			childTwig.Properties = childTwig.Properties or {}
@@ -147,7 +236,9 @@ function TwigTree.mount(self: Twig, Parent: Instance): MountedHandle
 	setmetatable(handle, {
 		__index = function(_, key)
 			if key == "GetRef" then
-				return function() return instance end
+				return function()
+					return instance
+				end
 			end
 			return instance[key]
 		end,
@@ -155,11 +246,23 @@ function TwigTree.mount(self: Twig, Parent: Instance): MountedHandle
 			return instance
 		end,
 	})
-	
-	self.OnMount(handle(), self)
+
+	self.instance = handle()
+	self.OnMount(self.instance, self)
+	for _, v in pairs(handlePlugins) do
+		v.plugin.init(self.instance, v.config)
+	end
 
 	return handle
 end
+
+TwigTree.Portal = require(script.Func.Portal)(TwigTree) :: (
+	targetParent: Twig | TwigComponent | Instance,
+	children: {Twig}
+) -> {
+	deconstruct: (self: {}) -> (),
+	[number]: Instance
+}
 
 -- TwigTree.Unmount is a function which completely removes the mounted object.
 function TwigTree:Unmount()
@@ -292,15 +395,25 @@ export type Twig = {
 	_unmounted: boolean?
 }
 
+export type TwigConstructor = {
+	create: (Class: string, Properties: {}?, Children: {}?) -> Twig,
+	mount: (Object: Twig | TwigComponent | Instance, targetParent: Instance) -> (() -> Instance),
+	Component: (Name: string, renderCallback: ({}?) -> Twig?) -> TwigComponent,
+	Portal: typeof(TwigTree.Portal),
+	instance: (self: TwigConstructor | Twig) -> Instance,
+	createContext: typeof(TwigTree.createContext),
+	createPlugin: typeof(TwigTree.createPlugin)
+}
+
 export type TwigComponent = typeof(TwigTree.Component())
 return setmetatable(TwigTree, {
 	__index = function(_, key)
 		if (key == "new") then
 			error('[TwigTree]: Gotten `TwigTree.new` instead of `TwigTree.create`, if you are attempting to use the State constructor, please make sure to use `TwigTree.State.new()`.')
 		end
-		
+
 		return TwigTree.Events[key]
 			or TwigTree.Spr[key]
 			or TwigTree.State[key]
 	end
-})
+}) :: TwigConstructor
